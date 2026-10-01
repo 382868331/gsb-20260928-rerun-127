@@ -35,6 +35,30 @@ type Sample struct {
 	Value     float64   `json:"value"`
 }
 
+type SourceStatus string
+
+const (
+	SourceActive    SourceStatus = "active"
+	SourceWithdrawn SourceStatus = "withdrawn"
+)
+
+type sourceState struct {
+	Source         Source       `json:"source"`
+	Status         SourceStatus `json:"status"`
+	WithdrawnAt    time.Time    `json:"withdrawn_at,omitempty"`
+	WithdrawReason string       `json:"withdraw_reason,omitempty"`
+}
+
+type Rejection struct {
+	At         time.Time `json:"at"`
+	SampleID   string    `json:"sample_id,omitempty"`
+	Metric     string    `json:"metric,omitempty"`
+	Source     string    `json:"source,omitempty"`
+	Timestamp  time.Time `json:"sample_timestamp,omitempty"`
+	ReasonCode string    `json:"reason_code"`
+	Message    string    `json:"message"`
+}
+
 type CounterResult struct {
 	Samples       int64   `json:"samples"`
 	Total         float64 `json:"total"`
@@ -51,9 +75,14 @@ type DistributionResult struct {
 }
 
 type WindowResult struct {
+	Level         int                           `json:"level"`
+	Revision      int                           `json:"revision"`
 	Start         time.Time                     `json:"start"`
 	End           time.Time                     `json:"end"`
 	Open          bool                          `json:"open"`
+	Superseded    bool                          `json:"superseded,omitempty"`
+	RevisedAt     time.Time                     `json:"revised_at,omitempty"`
+	Reason        string                        `json:"reason,omitempty"`
 	Counters      map[string]CounterResult      `json:"counters,omitempty"`
 	Distributions map[string]DistributionResult `json:"distributions,omitempty"`
 }
@@ -62,12 +91,15 @@ type Stats struct {
 	Metrics              int64  `json:"metrics"`
 	Sources              int64  `json:"sources"`
 	Windows              int64  `json:"windows"`
+	WindowRevisions      int64  `json:"window_revisions"`
 	DedupeEntries        int64  `json:"dedupe_entries"`
 	EstimatedMemoryBytes int64  `json:"estimated_memory_bytes"`
 	DuplicateSamples     int64  `json:"duplicate_samples"`
 	LateSamples          int64  `json:"late_samples"`
 	LimitErrors          int64  `json:"limit_errors"`
 	LastLimitError       string `json:"last_limit_error,omitempty"`
+	RejectionRecords     int64  `json:"rejection_records"`
+	DroppedRejections    int64  `json:"dropped_rejections"`
 }
 
 func (d Definition) validate() error {
