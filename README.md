@@ -1,44 +1,31 @@
 # 指标采集与聚合核心
 
-纯 Go 的嵌入式指标注册、采集与时间窗口聚合包，不依赖外部监控服务。后续告警系统可直接读取窗口快照。
+多级时间窗口聚合，支持来源更正（计数器重置 / 样本撤回 / 迟到样本），
+并保证同一贡献在重启或补算时不会重复累加。
 
-## 能力
+## 核心语义
 
-- 指标定义：支持累计计数器 `counter` 和带显式桶边界的 `distribution`。
-- 来源管理：注册来源，限制来源数量，并暴露当前来源数与超限错误。
-- 固定时间窗口：按配置的窗口大小聚合，窗口关闭后的迟到样本会被拒绝并计数。
-- 累计计数：同一来源同一指标的首个样本只建立基线；后续按增量累计，计数器回绕或重置时累计新值，负值不作为负增长。
-- 分布聚合：输出次数、总和、最小值、最大值和桶计数。
-- 幂等采样：样本 `ID` 全局去重，重复提交不会重复累计。
-- 资源上限：可配置最大指标数、最大来源数和估算内存上限，`Stats` 中可见超限次数和最近原因。
-- 检查点：通过 `Save`/`Load` 保存定义、来源、窗口、基线、去重记录和统计值；恢复后继续运行与完整运行一致。
+- **多级窗口**：`DEFAULT_LEVELS = (60, 300, 3600)` 秒，对齐取整。短窗口
+  `seal_due(now)` 封存后自动汇总（rollup）到下一级，同一调用内逐级级联。
+- **幂等贡献**：样本按 `sample_id` 持久去重；rollup 贡献键为
+  `rollup:{child_window}:v{version}`，重启重放或补算均为 `INSERT OR IGNORE`，
+  不会重复累加。父窗口聚合时同一子窗口只取最高版本。
+- **计数器重置**：新值 < 上次值时视为新周期，delta 取新值本身，并记录
+  `counter_reset` 事件（可查）。
+- **撤回边界**：`retract(source, metric, ts_start, ts_end)` 只撤回该来源在
+  闭区间内的样本。未封存窗口就地更正；已封存窗口生成新版本并向上级联，
+  旧版本统计保留可查。
+- **封存窗口修订**：封存窗口绝不覆盖。迟到样本（`apply_late`）或撤回触发
+  `version+1`，`revisions()` 返回每次修订的原因，可追溯。
+- **资源上限**：`max_contributions_per_window` 超限时样本被拒绝并写入
+  拒绝日志，`rejections()` 可查（含 sample_id、原因、时间）。
 
-## 快速使用
+## 验证
 
-    registry := metriccore.NewRegistry(metriccore.Config{
-        WindowSize:     time.Minute,
-        MaxSources:     1000,
-        MaxMetrics:     100,
-        MaxMemoryBytes: 64 << 20,
-    })
+`tests/` 用人工序列（计数器重置、分布样本迟到、部分来源退出、重启重放、
+限额拒绝）与独立的逐样本朴素计算对照，检查各级窗口的次数、总和与桶计数
+完全一致：
 
-    _ = registry.AddMetric(metriccore.Definition{
-        Name:         "http_latency",
-        Type:         metriccore.Distribution,
-        BucketBounds: []float64{5, 10, 25, 50, 100},
-    })
-    _ = registry.RegisterSource(metriccore.Source{ID: "api-1"})
-
-    err := registry.Ingest(metriccore.Sample{
-        ID:        "sample-0001",
-        Metric:    "http_latency",
-        Source:    "api-1",
-        Timestamp: time.Now().UTC(),
-        Value:     12.5,
-    })
-
-    registry.CloseWindows(time.Now())
-    windows := registry.SnapshotWindows()
-    stats := registry.Stats()
-
-窗口结果中的 key 由 `metriccore.ResultKey(sourceID, metricName)` 生成，也可以用 `metriccore.ParseResultKey` 还原。
+```bash
+python3 -m pytest tests/ -q
+```
