@@ -16,7 +16,37 @@ def _window_key(level: int, metric: str, start: int) -> str:
     return f"{level}:{metric}:{start}"
 
 
-def _entry(level, start, row, range_start, range_end):
+def _bucket_index(bounds, value):
+    for i, bound in enumerate(bounds):
+        if value <= bound:
+            return i
+    return len(bounds)
+
+
+def _range_aggregate(core, metric, start, end, lo, hi):
+    """Aggregate only the observations inside [lo, hi) of window [start, end).
+
+    A window the report range cuts through must contribute just its in-range
+    observations, never the whole pre-aggregated window (which may include
+    samples outside the pinned range, e.g. a 500s reading inside an hour
+    window reported over 0-60s).
+    """
+    level0 = core.levels[0]
+    rows = core.db.execute(
+        "SELECT c.kind, c.value FROM contributions c "
+        "JOIN samples s ON s.sample_id = c.sample_id "
+        "WHERE c.level=? AND c.metric=? AND c.start>=? AND c.start<? "
+        "AND c.retracted=0 AND s.ts>=? AND s.ts<?",
+        (level0, metric, start, end, lo, hi)).fetchall()
+    total = sum(value for _, value in rows)
+    buckets = [0] * (len(core.buckets) + 1)
+    for kind, value in rows:
+        if kind == "dist":
+            buckets[_bucket_index(core.buckets, value)] += 1
+    return len(rows), total, buckets
+
+
+def _entry(core, level, metric, start, row, range_start, range_end):
     end = start + level
     coverage = "full" if start >= range_start and end <= range_end else "partial"
     if row is None:
@@ -24,12 +54,23 @@ def _entry(level, start, row, range_start, range_end):
         # window whose observed values happen to be zero.
         return {"level": level, "start": start, "end": end,
                 "state": "empty", "coverage": coverage,
+                "range_restricted": False,
                 "version": None, "count": None, "sum": None, "buckets": None}
     status, version, count, total, buckets = row
+    restricted = False
+    if coverage == "partial":
+        # Range cuts through this window: count only in-range observations.
+        count, total, buckets = _range_aggregate(
+            core, metric, start, end,
+            max(range_start, start), min(range_end, end))
+        restricted = True
+    else:
+        buckets = json.loads(buckets)
     return {"level": level, "start": start, "end": end,
             "state": status, "coverage": coverage,
+            "range_restricted": restricted,
             "version": version, "count": count, "sum": total,
-            "buckets": json.loads(buckets)}
+            "buckets": buckets}
 
 
 def _reconcile(entries, levels):
@@ -97,7 +138,7 @@ def generate(core, metric, range_start, range_end, levels=None):
                     "SELECT status, version, count, sum, buckets FROM windows "
                     "WHERE window_key=?",
                     (_window_key(level, metric, start),)).fetchone()
-                entries.append(_entry(level, start, row,
+                entries.append(_entry(core, level, metric, start, row,
                                       range_start, range_end))
                 start += level
         discrepancies = _reconcile(entries, levels)
@@ -156,7 +197,10 @@ def adopt(core, report_id):
 
 
 def _changed(before, after):
-    fields = ("state", "version", "count", "sum", "buckets")
+    # A bare version bump (e.g. an out-of-range late sample revising a
+    # partially covered window) does not change any reported figure, so it
+    # must not show up as a difference.
+    fields = ("state", "count", "sum", "buckets")
     return {f: {"before": before[f], "after": after[f]}
             for f in fields if before[f] != after[f]}
 
@@ -187,6 +231,11 @@ def diff(core, old_id, new_id):
                             "changes": delta})
 
     rs, re_ = old["range_start"], old["range_end"]
+    # A revision only counts as in-range if it actually changed a reported
+    # figure. Classifying by window-start overlap would misattribute
+    # out-of-range corrections (e.g. a 510s late sample revising the hour
+    # window that starts at 0s) to a range they do not affect.
+    changed_keys = {(c["level"], c["start"]) for c in changed}
     in_range, out_of_range = [], []
     rows = core.db.execute(
         "SELECT window_key, version, reason FROM revisions "
@@ -197,7 +246,7 @@ def diff(core, old_id, new_id):
         item = {"level": level, "metric": metric, "start": start,
                 "version": version, "reason": reason}
         covered = (metric == old["metric"]
-                   and start < re_ and start + level > rs)
+                   and (level, start) in changed_keys)
         (in_range if covered else out_of_range).append(item)
 
     return {"old_report": old_id, "new_report": new_id,

@@ -188,3 +188,39 @@ def test_partial_coverage_marked_at_range_edges(tmp_path):
     assert entry(report, 60, 0)["coverage"] == "partial"
     assert entry(report, 60, 60)["coverage"] == "partial"
     assert entry(report, 3600, 0)["coverage"] == "partial"
+
+
+def test_partial_windows_count_only_in_range_observations(tmp_path):
+    db = str(tmp_path / "m.db")
+    core = MetricsCore(db)
+    core.ingest(dist(1, 5, 3.0))
+    core.ingest(dist(2, 500, 50.0))          # inside hour window, outside [0,60)
+    core.seal_due(now=1_000)
+
+    old = core.generate_report("latency", 0, 60)
+    minute = entry(old, 60, 0)
+    hour = entry(old, 3600, 0)
+    assert minute["coverage"] == "full" and minute["sum"] == pytest.approx(3.0)
+    # partial coverage: flagged, and restricted to the pinned range
+    assert hour["coverage"] == "partial" and hour["range_restricted"] is True
+    assert hour["count"] == 1 and hour["sum"] == pytest.approx(3.0)
+
+    # late data still outside the range must not move any reported figure
+    core.apply_late(dist(3, 510, 60.0))
+    new = core.generate_report("latency", 0, 60)
+    assert entry(new, 3600, 0)["sum"] == pytest.approx(3.0)
+    diff = core.diff_reports(old["report_id"], new["report_id"])
+    assert diff["changed"] == []
+    assert diff["revisions_in_range"] == []
+    # the out-of-range correction is reported as such, not misattributed by
+    # the hour window's start (0) falling inside the range
+    out = {(i["level"], i["start"]) for i in diff["revisions_out_of_range"]}
+    assert (60, 480) in out
+
+    # citations keep their justification after cleanup and reopen
+    core.purge_before(600)
+    core.close()
+    reopened = MetricsCore(db)
+    still_old = reopened.get_report(old["report_id"])
+    assert still_old["entries"] == old["entries"]
+    assert entry(still_old, 3600, 0)["sum"] == pytest.approx(3.0)
