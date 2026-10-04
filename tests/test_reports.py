@@ -188,3 +188,45 @@ def test_partial_coverage_marked_at_range_edges(tmp_path):
     assert entry(report, 60, 0)["coverage"] == "partial"
     assert entry(report, 60, 60)["coverage"] == "partial"
     assert entry(report, 3600, 0)["coverage"] == "partial"
+
+
+def test_partial_windows_count_only_in_range_observations(tmp_path):
+    db = str(tmp_path / "m.db")
+    core = MetricsCore(db)
+    core.ingest(dist(1, 5, 3.0))
+    core.ingest(dist(2, 500, 40.0))          # outside the fixed [0, 60) range
+    core.seal_due(now=10_000)
+
+    old = core.generate_report("latency", 0, 60)
+    old_id = old["report_id"]
+
+    # every granularity counts only observations inside [0, 60)
+    assert entry(old, 60, 0)["sum"] == pytest.approx(3.0)
+    hour = entry(old, 3600, 0)
+    assert hour["coverage"] == "partial"
+    assert hour["count"] == 1 and hour["sum"] == pytest.approx(3.0)
+    assert hour["covered_range"] == [0, 60]
+    assert "partial coverage" in hour["note"]
+    # the stored window itself still aggregates the whole hour
+    assert core.window(3600, "latency", 0)["sum"] == pytest.approx(43.0)
+
+    # a late correction outside the range must not touch the report
+    core.apply_late(dist(3, 510, 9.0))
+    new = core.generate_report("latency", 0, 60)
+    assert entry(new, 3600, 0)["sum"] == pytest.approx(3.0)
+    assert entry(new, 60, 0)["sum"] == pytest.approx(3.0)
+
+    diff = core.diff_reports(old_id, new["report_id"])
+    assert diff["changed"] == []             # nothing in range truly changed
+    assert diff["revisions_in_range"] == []
+    out = {(i["level"], i["start"]) for i in diff["revisions_out_of_range"]}
+    assert (3600, 0) in out                  # hour revision flagged out-of-range
+
+    # the old report is preserved verbatim, and citations survive cleanup
+    assert core.get_report(old_id) == old
+    core.purge_before(600)
+    core.close()
+    reopened = MetricsCore(db)
+    still_old = reopened.get_report(old_id)
+    assert entry(still_old, 3600, 0)["sum"] == pytest.approx(3.0)
+    assert entry(still_old, 3600, 0)["note"] == hour["note"]

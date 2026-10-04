@@ -16,20 +16,59 @@ def _window_key(level: int, metric: str, start: int) -> str:
     return f"{level}:{metric}:{start}"
 
 
-def _entry(level, start, row, range_start, range_end):
+def _partial_stats(core, metric, lo, hi):
+    """Aggregate only observations whose timestamp falls in [lo, hi).
+
+    Used for windows the pinned range cuts through: the stored window total
+    covers the whole window, so a partial entry must be recomputed from the
+    underlying (non-retracted) sample contributions instead.
+    """
+    rows = core.db.execute(
+        "SELECT c.kind, c.value FROM contributions c "
+        "JOIN samples s ON s.sample_id = c.sample_id "
+        "WHERE c.metric=? AND c.child_key IS NULL AND c.retracted=0 "
+        "AND s.ts>=? AND s.ts<?",
+        (metric, lo, hi)).fetchall()
+    count = 0
+    total = 0.0
+    buckets = [0] * (len(core.buckets) + 1)
+    for kind, value in rows:
+        count += 1
+        total += value
+        if kind == "dist":
+            buckets[core._bucket_index(value)] += 1
+    return count, total, buckets
+
+
+def _entry(core, level, metric, start, row, range_start, range_end):
     end = start + level
     coverage = "full" if start >= range_start and end <= range_end else "partial"
     if row is None:
         # No window ever materialised: genuinely empty, distinct from a
         # window whose observed values happen to be zero.
-        return {"level": level, "start": start, "end": end,
-                "state": "empty", "coverage": coverage,
-                "version": None, "count": None, "sum": None, "buckets": None}
-    status, version, count, total, buckets = row
-    return {"level": level, "start": start, "end": end,
-            "state": status, "coverage": coverage,
-            "version": version, "count": count, "sum": total,
-            "buckets": json.loads(buckets)}
+        entry = {"level": level, "start": start, "end": end,
+                 "state": "empty", "coverage": coverage,
+                 "version": None, "count": None, "sum": None, "buckets": None}
+    else:
+        status, version, count, total, buckets = row
+        entry = {"level": level, "start": start, "end": end,
+                 "state": status, "coverage": coverage,
+                 "version": version, "count": count, "sum": total,
+                 "buckets": json.loads(buckets)}
+    if coverage == "partial":
+        # The range cuts through this window: count only observations inside
+        # the pinned range and say so explicitly, instead of leaking
+        # out-of-range observations into the report.
+        lo, hi = max(start, range_start), min(end, range_end)
+        entry["covered_range"] = [lo, hi]
+        entry["note"] = (f"partial coverage: only observations in "
+                         f"[{lo}, {hi}) are counted")
+        if entry["state"] != "empty":
+            count, total, buckets = _partial_stats(core, metric, lo, hi)
+            entry["count"] = count
+            entry["sum"] = total
+            entry["buckets"] = buckets
+    return entry
 
 
 def _reconcile(entries, levels):
@@ -97,7 +136,7 @@ def generate(core, metric, range_start, range_end, levels=None):
                     "SELECT status, version, count, sum, buckets FROM windows "
                     "WHERE window_key=?",
                     (_window_key(level, metric, start),)).fetchone()
-                entries.append(_entry(level, start, row,
+                entries.append(_entry(core, level, metric, start, row,
                                       range_start, range_end))
                 start += level
         discrepancies = _reconcile(entries, levels)
@@ -156,7 +195,12 @@ def adopt(core, report_id):
 
 
 def _changed(before, after):
-    fields = ("state", "version", "count", "sum", "buckets")
+    fields = ["state", "version", "count", "sum", "buckets"]
+    if before["coverage"] == "partial":
+        # The stored version tracks the whole window; for a partially
+        # covered entry it can be bumped by corrections outside the pinned
+        # range, which never touch the reported figures.
+        fields.remove("version")
     return {f: {"before": before[f], "after": after[f]}
             for f in fields if before[f] != after[f]}
 
@@ -196,8 +240,13 @@ def diff(core, old_id, new_id):
         level, start = int(level), int(start)
         item = {"level": level, "metric": metric, "start": start,
                 "version": version, "reason": reason}
+        # A revision counts as in-range only when its window lies fully
+        # inside the pinned range. A partially overlapping aggregate window
+        # (e.g. the hour window starting at 0 for a [0, 60) report) may be
+        # revised by observations the report never counted, so judging by
+        # the window start alone would misclassify out-of-range corrections.
         covered = (metric == old["metric"]
-                   and start < re_ and start + level > rs)
+                   and start >= rs and start + level <= re_)
         (in_range if covered else out_of_range).append(item)
 
     return {"old_report": old_id, "new_report": new_id,
