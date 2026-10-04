@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS rejections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_id TEXT, metric TEXT, source TEXT, ts REAL, reason TEXT
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER
+);
+CREATE TABLE IF NOT EXISTS reports (
+    report_id TEXT PRIMARY KEY,
+    metric TEXT, range_start REAL, range_end REAL,
+    correction_version INTEGER,
+    revision_cursor INTEGER,
+    created_at REAL,
+    adopted INTEGER DEFAULT 0,
+    payload TEXT
+);
 """
 
 
@@ -84,7 +97,19 @@ class MetricsCore:
         self.late_grace = late_grace
         self.db = sqlite3.connect(db_path)
         self.db.executescript(SCHEMA)
+        self.db.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('correction_version',0)")
         self.db.commit()
+
+    # ------------------------------------------------------------- versioning
+    def _bump(self, cur):
+        # Every aggregate-affecting mutation advances the correction version,
+        # so a report can pin exactly which corrections it reflects.
+        cur.execute("UPDATE meta SET value=value+1 WHERE key='correction_version'")
+
+    def correction_version(self) -> int:
+        return self.db.execute(
+            "SELECT value FROM meta WHERE key='correction_version'").fetchone()[0]
 
     # ------------------------------------------------------------------ ingest
     def ingest(self, s: Sample) -> str:
@@ -128,6 +153,7 @@ class MetricsCore:
              value, s.source, s.sample_id))
         self._touch(cur, key, level0, s.metric, start)
         self._recompute(cur, key, "ingest")
+        self._bump(cur)
         self.db.commit()
         return "accepted"
 
@@ -220,6 +246,7 @@ class MetricsCore:
                 cur.execute("UPDATE windows SET status='sealed' WHERE window_key=?",
                             (key,))
                 self._rollup(cur, key, level, metric, start)
+                self._bump(cur)
         self.db.commit()
 
     def _rollup(self, cur, child_key, level, metric, start):
@@ -277,6 +304,8 @@ class MetricsCore:
                 "SELECT status FROM windows WHERE window_key=?", (key,)).fetchone()[0]
             if status == "sealed":
                 self._rollup(cur, key, level, metric_, start)
+        if rows:
+            self._bump(cur)
         self.db.commit()
         return len(rows)
 
@@ -334,6 +363,44 @@ class MetricsCore:
     def _event(self, type_: str, detail: dict):
         self.db.execute("INSERT INTO events(type,detail,ts) VALUES(?,?,?)",
                         (type_, json.dumps(detail), time.time()))
+
+    # ------------------------------------------------------------- maintenance
+    def purge_before(self, ts: float) -> dict:
+        # Drop raw samples/contributions/windows ending before ts. Stored
+        # reports are never touched: citations keep their full snapshot and
+        # remain explainable after background cleanup.
+        cur = self.db.cursor()
+        keys = [r[0] for r in cur.execute(
+            "SELECT window_key FROM windows WHERE start + level <= ?", (ts,))]
+        for key in keys:
+            cur.execute("DELETE FROM contributions WHERE window_key=?", (key,))
+            cur.execute("DELETE FROM windows WHERE window_key=?", (key,))
+            cur.execute("DELETE FROM revisions WHERE window_key=?", (key,))
+        samples = cur.execute(
+            "SELECT COUNT(*) FROM samples WHERE ts<?", (ts,)).fetchone()[0]
+        cur.execute("DELETE FROM samples WHERE ts<?", (ts,))
+        self._event("purge", {"before": ts, "windows": len(keys),
+                              "samples": samples})
+        self.db.commit()
+        return {"windows": len(keys), "samples": samples}
+
+    # ---------------------------------------------------------------- reports
+    def generate_report(self, metric: str, range_start: float,
+                        range_end: float, levels=None) -> dict:
+        from . import report as _report
+        return _report.generate(self, metric, range_start, range_end, levels)
+
+    def get_report(self, report_id: str):
+        from . import report as _report
+        return _report.get(self, report_id)
+
+    def adopt_report(self, report_id: str) -> dict:
+        from . import report as _report
+        return _report.adopt(self, report_id)
+
+    def diff_reports(self, old_id: str, new_id: str) -> dict:
+        from . import report as _report
+        return _report.diff(self, old_id, new_id)
 
     def close(self):
         self.db.close()

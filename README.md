@@ -20,6 +20,29 @@
 - **资源上限**：`max_contributions_per_window` 超限时样本被拒绝并写入
   拒绝日志，`rejections()` 可查（含 sample_id、原因、时间）。
 
+## 快照报告
+
+在既有入口（`window()` / `revisions()` 等）之外，`MetricsCore` 直接提供
+多粒度快照报告，无需新部署组件：
+
+- **一次报告、多个粒度**：`generate_report(metric, start, end)` 在单个
+  只读事务中捕获 `levels` 全部层级的窗口，读取过程中不会混入随后到达
+  的更正；报告固定观测范围 `[start, end)` 与 `correction_version`。
+- **粗细互核**：报告内置 rollup 对账，`consistent` / `discrepancies`
+  标明细粒度之和是否与汇总窗口一致。
+- **空窗 / 未覆盖 / 零值**：无数据的窗口为 `state="empty"`（数值为
+  `null`），仍在累计的窗口为 `state="open"`（`complete=False`），与
+  真实零值（如计数器无增长，`sum=0.0`）明确区分；范围边缘截断的窗口
+  标记 `coverage="partial"`。
+- **迟到数据与差异**：新迟到数据到达后旧报告原样保留；
+  `diff_reports(old_id, new_id)` 列出范围内发生变化的汇总，以及范围未
+  覆盖、因而不应影响报告的修订（`revisions_out_of_range`）。
+- **采用与引用**：`adopt_report(id)` 正式采用新版，旧版仍可
+  `get_report(id)` 引用；报告持久化于 `reports` 表，`purge_before(ts)`
+  清理底层窗口与样本时不会删除报告，引用不会失去解释依据。
+- **途中重开幂等**：报告 id 由内容哈希决定，处理途中重启后重新生成
+  得到同一 id（`INSERT OR IGNORE`），不会重复或漂移。
+
 ## 验证
 
 `tests/` 用人工序列（计数器重置、分布样本迟到、部分来源退出、重启重放、
