@@ -331,6 +331,16 @@ class MetricsCore:
         args = (type_,) if type_ else ()
         return [{"type": t, "detail": json.loads(d)} for t, d in self.db.execute(q, args)]
 
+    def purge_windows(self, before: float) -> int:
+        """Background cleanup: drop sealed windows ending at or before
+        `before`. Reports saved via metrics_core.report keep their own
+        snapshot, so citations remain interpretable after purging."""
+        cur = self.db.execute(
+            "DELETE FROM windows WHERE status='sealed' AND start + level <= ?",
+            (before,))
+        self.db.commit()
+        return cur.rowcount
+
     def _event(self, type_: str, detail: dict):
         self.db.execute("INSERT INTO events(type,detail,ts) VALUES(?,?,?)",
                         (type_, json.dumps(detail), time.time()))
