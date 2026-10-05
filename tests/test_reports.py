@@ -224,3 +224,97 @@ def test_partial_windows_count_only_in_range_observations(tmp_path):
     still_old = reopened.get_report(old["report_id"])
     assert still_old["entries"] == old["entries"]
     assert entry(still_old, 3600, 0)["sum"] == pytest.approx(3.0)
+
+
+def _decision(comparison, level, start):
+    for scope in comparison["scopes"]:
+        if scope["level"] == level and scope["window_start"] == start:
+            return scope
+    raise AssertionError(f"no decision {level}/{start}")
+
+
+def test_cross_report_intersection_comparison_persists_after_purge(tmp_path):
+    db = str(tmp_path / "m.db")
+    core = MetricsCore(db)
+    core.ingest(dist(1, 10, 3.0))
+    core.ingest(dist(2, 40, 5.0))
+    core.seal_due(now=1_000)
+    old = core.generate_report("latency", 0, 60)
+
+    before_revision = core.generate_report("latency", 30, 90)
+    first_decision = core.prepare_report_comparison(
+        old["report_id"], before_revision["report_id"], levels=(60, 300))
+    first_id = first_decision["comparison_id"]
+
+    core.apply_late(dist(3, 45, 7.0))
+    core.apply_late(dist(4, 70, 9.0))
+    new = core.generate_report("latency", 30, 90)
+    decision = core.prepare_report_comparison(
+        old["report_id"], new["report_id"], levels=(60, 300, 3600))
+
+    assert decision["requested_levels"] == [60, 300, 3600]
+    assert decision["adopted_levels"] == [60, 300, 3600]
+    assert old["correction_version"] < new["correction_version"]
+    minute = _decision(decision, 60, 0)
+    coarse = _decision(decision, 300, 0)
+    assert minute["classification"] == "intersection_only"
+    assert minute["intersection_range"] == [30, 60]
+    assert coarse["classification"] == "intersection_only"
+    assert coarse["intersection_range"] == [30, 60]
+    assert all(s["classification"] != "directly_comparable"
+               for s in decision["scopes"])
+
+    result = core.compare_report_intersection(decision["comparison_id"])
+    change = next(c for c in result["changed"]
+                  if c["level"] == 60 and c["window_start"] == 0)
+    assert change["before"]["sum"] == pytest.approx(5.0)
+    assert change["after"]["sum"] == pytest.approx(12.0)
+    assert change["delta"]["sum"] == pytest.approx(7.0)
+    assert change["added_sample_ids"] == ["d3"]
+    assert change["source_observations"]["before"][0]["report_id"] == old["report_id"]
+    assert change["source_observations"]["after"][-1]["report_id"] == new["report_id"]
+
+    core.retract("A", "latency", 45, 45, reason="withdraw late sample")
+    retracted = core.generate_report("latency", 30, 90)
+    later_decision = core.prepare_report_comparison(
+        old["report_id"], retracted["report_id"], levels=(60,))
+    assert later_decision["comparison_id"] != decision["comparison_id"]
+    assert core.get_report_comparison(first_id) == first_decision
+    assert core.get_report_comparison_result(decision["comparison_id"]) == result
+    assert core.get_report(old["report_id"])["entries"] == old["entries"]
+
+    core.purge_before(600)
+    core.close()
+    reopened = MetricsCore(db)
+    restored = reopened.get_report_comparison(decision["comparison_id"])
+    restored_result = reopened.get_report_comparison_result(
+        decision["comparison_id"])
+    assert restored["scopes"] == decision["scopes"]
+    restored_change = next(c for c in restored_result["changed"]
+                           if c["level"] == 60 and c["window_start"] == 0)
+    assert restored_change["delta"]["sum"] == pytest.approx(7.0)
+    assert restored_change["source_observations"]["after"][-1]["sample_id"] == "d3"
+
+
+def test_cross_report_separates_true_zero_from_missing_observations(tmp_path):
+    core = MetricsCore(str(tmp_path / "m.db"))
+    core.ingest(counter(1, 5, 10))
+    core.ingest(counter(2, 65, 10))
+    core.ingest(counter(3, 70, 10))
+    core.seal_due(now=10_000)
+    old = core.generate_report("requests", 0, 180)
+    new = core.generate_report("requests", 0, 180)
+
+    comparison = core.prepare_report_comparison(
+        old["report_id"], new["report_id"], levels=(60,))
+    assert _decision(comparison, 60, 60)["classification"] == "directly_comparable"
+    assert _decision(comparison, 60, 120)["classification"] == "no_basis"
+
+    result = core.compare_report_intersection(comparison["comparison_id"])
+    changed_starts = {c["window_start"] for c in result["changed"]}
+    assert 60 in changed_starts
+    assert 120 not in changed_starts
+    zero_change = next(c for c in result["changed"] if c["window_start"] == 60)
+    assert zero_change["before"]["count"] == 2
+    assert zero_change["before"]["sum"] == 0.0
+    assert zero_change["delta"]["sum"] == 0.0

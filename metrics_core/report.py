@@ -36,14 +36,34 @@ def _range_aggregate(core, metric, start, end, lo, hi):
         "SELECT c.kind, c.value FROM contributions c "
         "JOIN samples s ON s.sample_id = c.sample_id "
         "WHERE c.level=? AND c.metric=? AND c.start>=? AND c.start<? "
-        "AND c.retracted=0 AND s.ts>=? AND s.ts<?",
+        "AND c.retracted=0 AND s.ts>=? AND s.ts<? "
+        "GROUP BY c.sample_id",
         (level0, metric, start, end, lo, hi)).fetchall()
-    total = sum(value for _, value in rows)
-    buckets = [0] * (len(core.buckets) + 1)
-    for kind, value in rows:
-        if kind == "dist":
-            buckets[_bucket_index(core.buckets, value)] += 1
-    return len(rows), total, buckets
+    return _aggregate_observations(
+        [{"kind": kind, "value": value} for kind, value in rows],
+        core.buckets)
+
+
+def _observations(core, metric, lo, hi):
+    """Return the exact non-retracted level-zero observations in a range."""
+    level0 = core.levels[0]
+    rows = core.db.execute(
+        "SELECT DISTINCT s.sample_id, s.ts, c.kind, c.value "
+        "FROM contributions c JOIN samples s ON s.sample_id=c.sample_id "
+        "WHERE c.level=? AND c.metric=? AND c.retracted=0 "
+        "AND s.ts>=? AND s.ts<? ORDER BY s.sample_id",
+        (level0, metric, lo, hi)).fetchall()
+    return [{"sample_id": sid, "ts": ts, "kind": kind, "value": value}
+            for sid, ts, kind, value in rows]
+
+
+def _aggregate_observations(observations, bucket_bounds):
+    total = sum(o["value"] for o in observations)
+    buckets = [0] * (len(bucket_bounds) + 1)
+    for observation in observations:
+        if observation["kind"] == "dist":
+            buckets[_bucket_index(bucket_bounds, observation["value"])] += 1
+    return len(observations), total, buckets
 
 
 def _entry(core, level, metric, start, row, range_start, range_end):
@@ -114,6 +134,11 @@ def _report_id(metric, range_start, range_end, correction_version, entries):
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+def _decision_id(payload):
+    canonical = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
 def generate(core, metric, range_start, range_end, levels=None):
     """Build (or, after a crash/restart, rebuild identically) a pinned report.
 
@@ -141,10 +166,13 @@ def generate(core, metric, range_start, range_end, levels=None):
                 entries.append(_entry(core, level, metric, start, row,
                                       range_start, range_end))
                 start += level
+        observations = _observations(core, metric, range_start, range_end)
         discrepancies = _reconcile(entries, levels)
         report_id = _report_id(metric, range_start, range_end,
                                correction_version, entries)
-        payload = {"levels": list(levels), "entries": entries,
+        payload = {"levels": list(levels),
+                   "bucket_bounds": list(core.buckets), "entries": entries,
+                   "observations": observations,
                    "discrepancies": discrepancies}
         # INSERT OR IGNORE: regenerating after a mid-processing restart yields
         # the same deterministic id and never duplicates the stored report.
@@ -256,3 +284,202 @@ def diff(core, old_id, new_id):
             "changed": changed,
             "revisions_in_range": in_range,
             "revisions_out_of_range": out_of_range}
+
+
+def _require_reports(core, old_id, new_id):
+    old, new = get(core, old_id), get(core, new_id)
+    if old is None or new is None:
+        raise KeyError("both reports must exist")
+    if old["metric"] != new["metric"]:
+        raise ValueError("reports cover different metrics")
+    return old, new
+
+
+def _report_ref(report):
+    return {"report_id": report["report_id"],
+            "range": [report["range_start"], report["range_end"]],
+            "correction_version": report["correction_version"],
+            "revision_cursor": report["revision_cursor"],
+            "created_at": report["created_at"]}
+
+
+def _observations_in(report, level, start, end, lo, hi):
+    return [o for o in report.get("observations", [])
+            if lo <= o["ts"] < hi
+            and start <= o["ts"] < start + level]
+
+
+def _entry_ref(entry):
+    if entry is None:
+        return None
+    return {"state": entry["state"], "coverage": entry["coverage"],
+            "range_restricted": entry["range_restricted"],
+            "version": entry["version"], "start": entry["start"],
+            "end": entry["end"], "count": entry["count"],
+            "sum": entry["sum"]}
+
+
+def _scope_decision(old, new, level, window_start, old_entries, new_entries):
+    window_end = window_start + level
+    old_lo = max(old["range_start"], window_start)
+    old_hi = min(old["range_end"], window_end)
+    new_lo = max(new["range_start"], window_start)
+    new_hi = min(new["range_end"], window_end)
+    lo, hi = max(old_lo, new_lo), min(old_hi, new_hi)
+    if lo >= hi:
+        return None
+
+    old_entry = old_entries[(level, window_start)]
+    new_entry = new_entries[(level, window_start)]
+    old_obs = _observations_in(old, level, window_start, window_end, lo, hi)
+    new_obs = _observations_in(new, level, window_start, window_end, lo, hi)
+    full = (old_entry["coverage"] == "full"
+            and new_entry["coverage"] == "full"
+            and lo == window_start and hi == window_end)
+    old_sealed_zero = (old_entry["state"] == "sealed"
+                       and old_entry["count"] is not None)
+    new_sealed_zero = (new_entry["state"] == "sealed"
+                       and new_entry["count"] is not None)
+    if full and old_sealed_zero and new_sealed_zero:
+        classification = "directly_comparable"
+        reason = "both reports observe the complete aligned window"
+    elif old_obs and new_obs:
+        classification = "intersection_only"
+        reason = "both reports have observations in the common intersection"
+    else:
+        classification = "no_basis"
+        missing = []
+        if not old_obs and not old_sealed_zero:
+            missing.append("old")
+        if not new_obs and not new_sealed_zero:
+            missing.append("new")
+        reason = "no observed facts on the " + " and ".join(missing) + " side"
+
+    return {"level": level, "window_start": window_start,
+            "window_end": window_end,
+            "old_observed_range": [old_lo, old_hi],
+            "new_observed_range": [new_lo, new_hi],
+            "intersection_range": [lo, hi],
+            "classification": classification, "reason": reason,
+            "old": _entry_ref(old_entry), "new": _entry_ref(new_entry),
+            "old_observation_count": len(old_obs),
+            "new_observation_count": len(new_obs),
+            "old_sample_ids": [o["sample_id"] for o in old_obs],
+            "new_sample_ids": [o["sample_id"] for o in new_obs]}
+
+
+def prepare_comparison(core, old_id, new_id, levels=None):
+    """Persist the user's comparison basis before calculating any changes."""
+    old, new = _require_reports(core, old_id, new_id)
+    requested = tuple(sorted(levels or (
+            set(old["levels"]) & set(new["levels"]))))
+    available = set(old["levels"]) & set(new["levels"])
+    adopted = tuple(level for level in requested if level in available)
+    skipped = [{"level": level,
+                "reason": "granularity is not present in both selected reports"}
+               for level in requested if level not in available]
+    old_entries = {(e["level"], e["start"]): e for e in old["entries"]}
+    new_entries = {(e["level"], e["start"]): e for e in new["entries"]}
+    scopes = []
+    for level in adopted:
+        start = int(min(old["range_start"], new["range_start"]) // level) * level
+        end_limit = max(old["range_end"], new["range_end"])
+        while start < end_limit:
+            decision = _scope_decision(
+                old, new, level, start, old_entries, new_entries)
+            if decision is not None:
+                scopes.append(decision)
+            start += level
+
+    payload = {"old_report": _report_ref(old),
+               "new_report": _report_ref(new),
+               "metric": old["metric"],
+               "requested_levels": list(requested),
+               "adopted_levels": list(adopted),
+               "skipped_levels": skipped,
+               "scopes": scopes}
+    comparison_id = _decision_id(payload)
+    payload = {"comparison_id": comparison_id, **payload,
+               "created_at": time.time()}
+    core.db.execute(
+        "INSERT OR IGNORE INTO report_comparisons(comparison_id,old_report_id,"
+        "new_report_id,requested_levels,adopted_levels,created_at,payload) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (comparison_id, old_id, new_id, json.dumps(list(requested)),
+         json.dumps(list(adopted)), payload["created_at"],
+         json.dumps(payload, sort_keys=True)))
+    core.db.commit()
+    return payload
+
+
+def _load_stored(core, table, comparison_id):
+    row = core.db.execute(
+        f"SELECT payload FROM {table} WHERE comparison_id=?",
+        (comparison_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def get_comparison(core, comparison_id):
+    return _load_stored(core, "report_comparisons", comparison_id)
+
+
+def get_comparison_result(core, comparison_id):
+    return _load_stored(core, "report_comparison_results", comparison_id)
+
+
+def _observation_detail(report, observations):
+    return [{"sample_id": o["sample_id"], "ts": o["ts"],
+             "kind": o["kind"], "value": o["value"],
+             "report_id": report["report_id"],
+             "correction_version": report["correction_version"]}
+            for o in observations]
+
+
+def compare_intersection(core, comparison_id):
+    """Calculate changes only over scopes with evidence on both sides."""
+    decision = get_comparison(core, comparison_id)
+    if decision is None:
+        raise KeyError(f"unknown comparison {comparison_id!r}")
+    old = get(core, decision["old_report"]["report_id"])
+    new = get(core, decision["new_report"]["report_id"])
+    changes = []
+    for scope in decision["scopes"]:
+        if scope["classification"] == "no_basis":
+            continue
+        lo, hi = scope["intersection_range"]
+        level, window_start = scope["level"], scope["window_start"]
+        window_end = scope["window_end"]
+        old_obs = _observations_in(old, level, window_start, window_end, lo, hi)
+        new_obs = _observations_in(new, level, window_start, window_end, lo, hi)
+        bounds = new.get("bucket_bounds", core.buckets)
+        old_count, old_sum, old_buckets = _aggregate_observations(old_obs, bounds)
+        new_count, new_sum, new_buckets = _aggregate_observations(new_obs, bounds)
+        old_ids = {o["sample_id"] for o in old_obs}
+        new_ids = {o["sample_id"] for o in new_obs}
+        changes.append({
+            "level": level, "window_start": window_start,
+            "window_end": window_end, "intersection_range": [lo, hi],
+            "classification": scope["classification"],
+            "before": {"count": old_count, "sum": old_sum,
+                       "buckets": old_buckets},
+            "after": {"count": new_count, "sum": new_sum,
+                      "buckets": new_buckets},
+            "delta": {"count": new_count - old_count,
+                      "sum": new_sum - old_sum,
+                      "buckets": [b - a for a, b in zip(old_buckets, new_buckets)]},
+            "added_sample_ids": sorted(new_ids - old_ids),
+            "removed_sample_ids": sorted(old_ids - new_ids),
+            "source_observations": {
+                "before": _observation_detail(old, old_obs),
+                "after": _observation_detail(new, new_obs)}})
+
+    payload = {"comparison_id": comparison_id,
+               "decision": decision,
+               "changed": changes,
+               "created_at": time.time()}
+    core.db.execute(
+        "INSERT OR IGNORE INTO report_comparison_results(comparison_id,created_at,payload) "
+        "VALUES(?,?,?)",
+        (comparison_id, payload["created_at"], json.dumps(payload, sort_keys=True)))
+    core.db.commit()
+    return payload

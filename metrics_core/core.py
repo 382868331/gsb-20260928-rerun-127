@@ -69,6 +69,20 @@ CREATE TABLE IF NOT EXISTS reports (
     adopted INTEGER DEFAULT 0,
     payload TEXT
 );
+CREATE TABLE IF NOT EXISTS report_comparisons (
+    comparison_id TEXT PRIMARY KEY,
+    old_report_id TEXT,
+    new_report_id TEXT,
+    requested_levels TEXT,
+    adopted_levels TEXT,
+    created_at REAL,
+    payload TEXT
+);
+CREATE TABLE IF NOT EXISTS report_comparison_results (
+    comparison_id TEXT PRIMARY KEY,
+    created_at REAL,
+    payload TEXT
+);
 """
 
 
@@ -401,6 +415,23 @@ class MetricsCore:
     def diff_reports(self, old_id: str, new_id: str) -> dict:
         from . import report as _report
         return _report.diff(self, old_id, new_id)
+
+    def prepare_report_comparison(self, old_id: str, new_id: str,
+                                  levels=None) -> dict:
+        from . import report as _report
+        return _report.prepare_comparison(self, old_id, new_id, levels)
+
+    def get_report_comparison(self, comparison_id: str):
+        from . import report as _report
+        return _report.get_comparison(self, comparison_id)
+
+    def compare_report_intersection(self, comparison_id: str) -> dict:
+        from . import report as _report
+        return _report.compare_intersection(self, comparison_id)
+
+    def get_report_comparison_result(self, comparison_id: str):
+        from . import report as _report
+        return _report.get_comparison_result(self, comparison_id)
 
     def close(self):
         self.db.close()
