@@ -224,3 +224,80 @@ def test_partial_windows_count_only_in_range_observations(tmp_path):
     still_old = reopened.get_report(old["report_id"])
     assert still_old["entries"] == old["entries"]
     assert entry(still_old, 3600, 0)["sum"] == pytest.approx(3.0)
+
+
+def test_cross_report_intersection_comparison_is_persisted(tmp_path):
+    db = str(tmp_path / "m.db")
+    core = MetricsCore(db)
+    core.ingest(dist(1, 5, 3.0))
+    core.ingest(dist(2, 65, 12.0))
+    core.seal_due(now=1_000)
+
+    left = core.generate_report("latency", 0, 90, levels=(60, 300))
+    core.apply_late(dist(3, 80, 8.0))
+    right = core.generate_report("latency", 60, 180, levels=(60, 3600))
+
+    decision = core.compare_reports(left["report_id"], right["report_id"])
+    assert decision["requested_basis"] == "intersection"
+    assert decision["effective_basis"] == "intersection"
+    assert decision["directly_comparable"] == []
+    assert [(i["start"], i["end"]) for i in decision["intersection_only"]] == [(60, 90)]
+    overlap = decision["intersection_only"][0]
+    assert overlap["left"]["sum"] == pytest.approx(12.0)
+    assert overlap["right"]["sum"] == pytest.approx(20.0)
+    assert overlap["change"]["sum"] == pytest.approx(8.0)
+    assert [(i["start"], i["end"]) for i in decision["no_comparable_basis"]] == [
+        (0, 60), (90, 120), (120, 180)]
+    assert decision["left_report"]["correction_version"] < \
+        decision["right_report"]["correction_version"]
+    assert decision["change_sources"][0]["level"] == 60
+    assert decision["change_sources"][0]["start"] == 60
+    assert decision["change_sources"][0]["revisions"]
+
+    # A later in-range correction creates another decision; the first remains
+    # an explanation of the two versions it originally compared.
+    core.retract("A", "latency", 70, 90, reason="withdraw late observation")
+    third = core.generate_report("latency", 60, 180, levels=(60, 3600))
+    later = core.compare_reports(left["report_id"], third["report_id"])
+    assert later["comparison_id"] != decision["comparison_id"]
+
+    # Cleanup may remove the original windows/revision table rows before a
+    # human actually creates the comparison. Report snapshots must therefore
+    # reproduce both the intersection and the source versions.
+    core.purge_before(180)
+    after_cleanup = core.compare_reports(left["report_id"], right["report_id"])
+    assert after_cleanup["comparison_id"] == decision["comparison_id"]
+    assert after_cleanup["change_sources"] == decision["change_sources"]
+    core.close()
+    reopened = MetricsCore(db)
+    restored = reopened.get_report_comparison(decision["comparison_id"])
+    assert restored == decision
+    assert restored["intersection_only"][0]["change"]["sum"] == pytest.approx(8.0)
+    assert restored["change_sources"][0]["revisions"]
+
+
+def test_cross_report_zero_is_not_manufactured_from_unobserved_time(tmp_path):
+    core = MetricsCore(str(tmp_path / "m.db"))
+    core.ingest(counter(1, 5, 10))
+    core.ingest(counter(2, 65, 10))               # sealed real zero
+    core.ingest(counter(3, 70, 10))
+    core.seal_due(now=1_000)
+
+    left = core.generate_report("requests", 0, 90, levels=(60, 300))
+    right = core.generate_report("requests", 60, 180, levels=(60, 300))
+    decision = core.compare_reports(left["report_id"], right["report_id"])
+
+    overlap = decision["intersection_only"]
+    assert [(i["start"], i["end"]) for i in overlap] == [(60, 90)]
+    assert overlap[0]["left"]["count"] == 2
+    assert overlap[0]["left"]["sum"] == 0.0
+    assert overlap[0]["change"]["sum"] == 0.0
+    missing = {(i["start"], i["end"]): i for i in decision["no_comparable_basis"]}
+    assert (120, 180) in missing
+    assert missing[(120, 180)]["change"] is None
+
+    direct_only = core.compare_reports(
+        left["report_id"], right["report_id"], basis="direct")
+    assert direct_only["intersection_only"] == []
+    assert any(i["start"] == 60 and i["change"] is None
+               for i in direct_only["no_comparable_basis"])

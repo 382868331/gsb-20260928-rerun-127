@@ -49,12 +49,16 @@ def _range_aggregate(core, metric, start, end, lo, hi):
 def _entry(core, level, metric, start, row, range_start, range_end):
     end = start + level
     coverage = "full" if start >= range_start and end <= range_end else "partial"
+    observed_start = max(start, range_start)
+    observed_end = min(end, range_end)
     if row is None:
         # No window ever materialised: genuinely empty, distinct from a
         # window whose observed values happen to be zero.
         return {"level": level, "start": start, "end": end,
                 "state": "empty", "coverage": coverage,
                 "range_restricted": False,
+                "observed_start": observed_start if coverage == "partial" else start,
+                "observed_end": observed_end if coverage == "partial" else end,
                 "version": None, "count": None, "sum": None, "buckets": None}
     status, version, count, total, buckets = row
     restricted = False
@@ -69,8 +73,53 @@ def _entry(core, level, metric, start, row, range_start, range_end):
     return {"level": level, "start": start, "end": end,
             "state": status, "coverage": coverage,
             "range_restricted": restricted,
+            "observed_start": observed_start if coverage == "partial" else start,
+            "observed_end": observed_end if coverage == "partial" else end,
             "version": version, "count": count, "sum": total,
             "buckets": buckets}
+
+
+def _observations(core, metric, range_start, range_end):
+    level0 = core.levels[0]
+    rows = core.db.execute(
+        "SELECT s.ts, c.kind, c.value FROM contributions c "
+        "JOIN samples s ON s.sample_id = c.sample_id "
+        "WHERE c.level=? AND c.metric=? AND c.retracted=0 "
+        "AND s.ts>=? AND s.ts<? ORDER BY s.ts, s.sample_id",
+        (level0, metric, range_start, range_end)).fetchall()
+    return [{"ts": ts, "kind": kind, "value": value,
+             "bucket": _bucket_index(core.buckets, value) if kind == "dist" else None}
+            for ts, kind, value in rows]
+
+
+def _revision_snapshot(db, entries, metric):
+    sources = []
+    keys = sorted({(e["level"], e["start"]) for e in entries
+                   if e.get("version") is not None})
+    for level, start in keys:
+        rows = db.execute(
+            "SELECT version, reason FROM revisions WHERE window_key=? ORDER BY id",
+            (_window_key(level, metric, start),)).fetchall()
+        if rows:
+            sources.append({"level": level, "start": start,
+                            "revisions": [{"version": v, "reason": r}
+                                           for v, r in rows]})
+    return sources
+
+
+def _aggregate_observations(report, lo, hi):
+    rows = [o for o in report.get("observations", [])
+            if lo <= o["ts"] < hi]
+    if not rows:
+        return None
+    bounds = report.get("bucket_bounds")
+    bucket_count = len(bounds) + 1 if bounds is not None else None
+    buckets = [0] * bucket_count if bucket_count is not None else []
+    for observation in rows:
+        if observation["kind"] == "dist" and buckets:
+            buckets[observation["bucket"]] += 1
+    return {"count": len(rows), "sum": sum(o["value"] for o in rows),
+            "buckets": buckets if buckets else None}
 
 
 def _reconcile(entries, levels):
@@ -130,6 +179,7 @@ def generate(core, metric, range_start, range_end, levels=None):
         revision_cursor = db.execute(
             "SELECT COALESCE(MAX(id),0) FROM revisions").fetchone()[0]
         entries = []
+        observations = _observations(core, metric, range_start, range_end)
         for level in levels:
             first = int(range_start // level) * level
             start = first
@@ -142,10 +192,14 @@ def generate(core, metric, range_start, range_end, levels=None):
                                       range_start, range_end))
                 start += level
         discrepancies = _reconcile(entries, levels)
+        revision_sources = _revision_snapshot(db, entries, metric)
         report_id = _report_id(metric, range_start, range_end,
                                correction_version, entries)
         payload = {"levels": list(levels), "entries": entries,
-                   "discrepancies": discrepancies}
+                   "discrepancies": discrepancies,
+                   "observations": observations,
+                   "bucket_bounds": list(core.buckets),
+                   "revision_sources": revision_sources}
         # INSERT OR IGNORE: regenerating after a mid-processing restart yields
         # the same deterministic id and never duplicates the stored report.
         db.execute(
@@ -256,3 +310,208 @@ def diff(core, old_id, new_id):
             "changed": changed,
             "revisions_in_range": in_range,
             "revisions_out_of_range": out_of_range}
+
+
+def _observed_interval(entry):
+    if entry is None or entry.get("state") == "empty":
+        return None
+    if entry.get("state") == "sealed":
+        return entry["observed_start"], entry["observed_end"]
+    return None
+
+
+def _zero_value(report):
+    bounds = report.get("bucket_bounds") or []
+    return {"count": 0, "sum": 0.0, "buckets": [0] * (len(bounds) + 1)}
+
+
+def _value_from(entry):
+    if entry is None or entry["state"] == "empty":
+        return None
+    return {"count": entry["count"], "sum": entry["sum"],
+            "buckets": entry["buckets"]}
+
+
+def _delta(left, right):
+    if left is None or right is None:
+        return None
+    out = {"count": right["count"] - left["count"],
+           "sum": right["sum"] - left["sum"]}
+    if len(left["buckets"]) == len(right["buckets"]):
+        out["buckets"] = [b - a for a, b in zip(left["buckets"], right["buckets"])]
+    else:
+        out["buckets"] = None
+    return out
+
+
+def _entry_map(report, level):
+    return {(e["level"], e["start"]): e for e in report["entries"]
+            if e["level"] == level}
+
+
+def _common_levels(left, right):
+    return sorted(set(left["levels"]) & set(right["levels"]))
+
+
+def _scope(level, left, right, lo, hi, kind, reason,
+           left_value=None, right_value=None, include_change=True):
+    item = {"level": level, "start": lo, "end": hi, "kind": kind,
+            "reason": reason,
+            "left_entry_version": left.get("version") if left else None,
+            "right_entry_version": right.get("version") if right else None}
+    if left_value is not None:
+        item["left"] = left_value
+    if right_value is not None:
+        item["right"] = right_value
+    if include_change and left_value is not None and right_value is not None:
+        item["change"] = _delta(left_value, right_value)
+    else:
+        item["change"] = None
+    return item
+
+
+def compare(core, left_id, right_id, basis="intersection"):
+    if basis not in ("intersection", "direct"):
+        raise ValueError("basis must be 'intersection' or 'direct'")
+    left, right = get(core, left_id), get(core, right_id)
+    if left is None or right is None:
+        raise KeyError("both reports must exist")
+
+    levels = _common_levels(left, right)
+    direct, intersection_only, no_basis = [], [], []
+    changed_keys = set()
+    comparable = left["metric"] == right["metric"] and bool(levels)
+
+    if comparable:
+        finest = levels[0]
+        left_entries = _entry_map(left, finest)
+        right_entries = _entry_map(right, finest)
+        boundaries = {min(left["range_start"], right["range_start"])}
+        boundaries.update(start + finest for _, start in left_entries)
+        boundaries.update(start + finest for _, start in right_entries)
+        boundaries.update({left["range_end"], right["range_end"]})
+        range_min = min(left["range_start"], right["range_start"])
+        range_max = max(left["range_end"], right["range_end"])
+        boundaries = sorted(b for b in boundaries if range_min < b <= range_max)
+        cursor = range_min
+        for boundary in boundaries:
+            if boundary <= cursor:
+                continue
+            window_start = int(cursor // finest) * finest
+            left_entry = left_entries.get((finest, window_start))
+            right_entry = right_entries.get((finest, window_start))
+            left_value = _aggregate_observations(left, cursor, boundary)
+            right_value = _aggregate_observations(right, cursor, boundary)
+            left_interval = _observed_interval(left_entry)
+            right_interval = _observed_interval(right_entry)
+            left_full = left_interval == (window_start, window_start + finest)
+            right_full = right_interval == (window_start, window_start + finest)
+            left_has = left_full or left_value is not None
+            right_has = right_full or right_value is not None
+            if left_has and left_value is None:
+                left_value = _zero_value(left)
+            if right_has and right_value is None:
+                right_value = _zero_value(right)
+            if left_has and right_has:
+                kind = "direct" if left_interval == right_interval else "intersection_only"
+                reason = ("identical observed interval and granularity"
+                          if kind == "direct" else "only the observed intersection has evidence in both reports")
+                item = _scope(finest, left_entry, right_entry, cursor, boundary,
+                              kind, reason, left_value, right_value)
+                (direct if kind == "direct" else intersection_only).append(item)
+            elif left_has or right_has:
+                no_basis.append(_scope(
+                    finest, left_entry, right_entry, cursor, boundary, "no_basis",
+                    "one report lacks an observed basis for this interval",
+                    left_value if left_has else None,
+                    right_value if right_has else None, False))
+            else:
+                no_basis.append(_scope(
+                    finest, left_entry, right_entry, cursor, boundary, "no_basis",
+                    "neither report contains an observed basis", None, None, False))
+            cursor = boundary
+
+        if basis == "direct":
+            moved = intersection_only
+            intersection_only = []
+            for item in moved:
+                item["kind"] = "no_basis"
+                item["reason"] = "direct comparison requires identical observed intervals"
+                item["change"] = None
+                no_basis.append(item)
+
+    change_sources = []
+    changed_keys = {
+        (item["level"], item["start"])
+        for item in direct + intersection_only
+        if item["change"] is not None and (
+            item["change"]["count"] or item["change"]["sum"]
+            or item["change"]["buckets"])}
+    for level, start in sorted(changed_keys):
+        revision_rows = []
+        for report in (left, right):
+            for source in report.get("revision_sources", []):
+                if source["level"] == level and source["start"] == start:
+                    revision_rows.extend(
+                        (r["version"], r["reason"]) for r in source["revisions"])
+        if not revision_rows:
+            key = _window_key(level, left["metric"], start)
+            revision_rows = core.db.execute(
+                "SELECT version, reason FROM revisions WHERE window_key=? ORDER BY id",
+                (key,)).fetchall()
+        revision_rows = sorted(set(revision_rows))
+        change_sources.append({
+            "level": level, "start": start,
+            "revisions": [{"version": version, "reason": reason}
+                           for version, reason in revision_rows],
+            "left_report": {"report_id": left_id,
+                             "correction_version": left["correction_version"]},
+            "right_report": {"report_id": right_id,
+                              "correction_version": right["correction_version"]}})
+    payload = {
+        "left_report": {"report_id": left_id,
+                        "correction_version": left["correction_version"],
+                        "adopted": left["adopted"],
+                        "metric": left["metric"],
+                        "range": [left["range_start"], left["range_end"]],
+                        "levels": left["levels"]},
+        "right_report": {"report_id": right_id,
+                         "correction_version": right["correction_version"],
+                         "adopted": right["adopted"],
+                         "metric": right["metric"],
+                         "range": [right["range_start"], right["range_end"]],
+                         "levels": right["levels"]},
+        "requested_basis": basis,
+        "effective_basis": basis if comparable else "none",
+        "directly_comparable": direct,
+        "intersection_only": intersection_only,
+        "no_comparable_basis": no_basis,
+        "changed_windows": sorted(list(changed_keys)),
+        "change_sources": change_sources,
+    }
+    canonical = json.dumps({"left": left_id, "right": right_id,
+                            "basis": basis, "decision": payload},
+                           sort_keys=True)
+    comparison_id = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    core.db.execute(
+        "INSERT OR IGNORE INTO report_comparisons(comparison_id,left_report_id,"
+        "right_report_id,requested_basis,created_at,payload) VALUES(?,?,?,?,?,?)",
+        (comparison_id, left_id, right_id, basis, time.time(),
+         json.dumps(payload, sort_keys=True)))
+    core.db.commit()
+    return get_comparison(core, comparison_id)
+
+
+def get_comparison(core, comparison_id):
+    row = core.db.execute(
+        "SELECT comparison_id,left_report_id,right_report_id,requested_basis,"
+        "created_at,payload FROM report_comparisons WHERE comparison_id=?",
+        (comparison_id,)).fetchone()
+    if row is None:
+        return None
+    cid, left_id, right_id, basis, created_at, payload = row
+    out = {"comparison_id": cid, "left_report_id": left_id,
+           "right_report_id": right_id, "requested_basis": basis,
+           "created_at": created_at}
+    out.update(json.loads(payload))
+    return out

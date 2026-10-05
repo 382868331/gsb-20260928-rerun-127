@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS reports (
     adopted INTEGER DEFAULT 0,
     payload TEXT
 );
+CREATE TABLE IF NOT EXISTS report_comparisons (
+    comparison_id TEXT PRIMARY KEY,
+    left_report_id TEXT,
+    right_report_id TEXT,
+    requested_basis TEXT,
+    created_at REAL,
+    payload TEXT
+);
 """
 
 
@@ -401,6 +409,15 @@ class MetricsCore:
     def diff_reports(self, old_id: str, new_id: str) -> dict:
         from . import report as _report
         return _report.diff(self, old_id, new_id)
+
+    def compare_reports(self, left_id: str, right_id: str,
+                        basis: str = "intersection") -> dict:
+        from . import report as _report
+        return _report.compare(self, left_id, right_id, basis)
+
+    def get_report_comparison(self, comparison_id: str):
+        from . import report as _report
+        return _report.get_comparison(self, comparison_id)
 
     def close(self):
         self.db.close()

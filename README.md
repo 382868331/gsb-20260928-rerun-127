@@ -46,6 +46,14 @@
 - **采用与引用**：`adopt_report(id)` 正式采用新版，旧版仍可
   `get_report(id)` 引用；报告持久化于 `reports` 表，`purge_before(ts)`
   清理底层窗口与样本时不会删除报告，引用不会失去解释依据。
+- **跨报告可比性核对**：`compare_reports(left_id, right_id, basis=...)`
+  先返回 `directly_comparable`、`intersection_only` 与
+  `no_comparable_basis` 三类观察范围；交集变化只使用两份报告快照内都有
+  观测依据的区间。部分粗窗不会按整窗总量比较，空窗、开放窗口的未采样
+  区间也不会补零。选择 `basis="direct"` 时，边界部分重叠会被移入无依据；
+  默认 `basis="intersection"` 才计算交集变化。比较决定及双方实际报告版本、
+  变化来源存入 `report_comparisons`，之后补录或撤回只会生成新决定，旧解释
+  不改写；即使原窗口已清理，重开后仍可从报告快照复现交集。
 - **途中重开幂等**：报告 id 由内容哈希决定，处理途中重启后重新生成
   得到同一 id（`INSERT OR IGNORE`），不会重复或漂移。
 
